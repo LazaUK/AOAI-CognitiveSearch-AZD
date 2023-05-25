@@ -3,12 +3,23 @@ from azure.search.documents import SearchClient
 from azure.search.documents.models import QueryType
 from approaches.approach import Approach
 from text import nonewlines
+import json
 
 # Simple retrieve-then-read implementation, using the Cognitive Search and OpenAI APIs directly. It first retrieves
 # top documents from search, then constructs a prompt with them, and then uses OpenAI to generate an completion 
 # (answer) with that prompt.
 class ChatReadRetrieveReadApproach(Approach):
-    prompt_prefix = """<|im_start|>system
+#         prompt_prefix = """<|im_start|>system
+# Assistant helps the company employees with their healthcare plan questions, and questions about the employee handbook. Be brief in your answers.
+# Answer ONLY with the facts listed in the list of sources below. If there isn't enough information below, say you don't know. Do not generate answers that don't use the sources below. If asking a clarifying question to the user would help, ask the question.
+# For tabular information return it as an html table. Do not return markdown format.
+# Each source has a name followed by colon and the actual information, always include the source name for each fact you use in the response. Use square brakets to reference the source, e.g. [info1.txt]. Don't combine sources, list each source separately, e.g. [info1.txt][info2.pdf].
+# {follow_up_questions_prompt}
+# {injected_prompt}
+# Sources:
+# {sources}
+# <|im_end|>
+    prompt_prefix = """{"role": "system", "content":
 Assistant helps the company employees with their healthcare plan questions, and questions about the employee handbook. Be brief in your answers.
 Answer ONLY with the facts listed in the list of sources below. If there isn't enough information below, say you don't know. Do not generate answers that don't use the sources below. If asking a clarifying question to the user would help, ask the question.
 For tabular information return it as an html table. Do not return markdown format.
@@ -17,7 +28,7 @@ Each source has a name followed by colon and the actual information, always incl
 {injected_prompt}
 Sources:
 {sources}
-<|im_end|>
+}
 {chat_history}
 """
 
@@ -55,15 +66,31 @@ Search query:
         filter = "category ne '{}'".format(exclude_category.replace("'", "''")) if exclude_category else None
 
         # STEP 1: Generate an optimized keyword search query based on the chat history and the last question
-        prompt = self.query_prompt_template.format(chat_history=self.get_chat_history_as_text(history, include_last_turn=False), question=history[-1]["user"])
+        # prompt = self.query_prompt_template.format(chat_history=self.get_chat_history_as_text(history, include_last_turn=False), question=history[-1]["user"])
+        # completion = openai.Completion.create(
+        #     engine=self.gpt_deployment, 
+        #     prompt=prompt, 
+        #     temperature=0.0, 
+        #     max_tokens=32, 
+        #     n=1, 
+        #     stop=["\n"])
+
+        prompt = self.query_prompt_template.format(chat_history=self.get_chat_history_as_text(history, include_last_turn=False), question=history[-1]["content"])
+        # LAZIZ CHECKPOINT # 1a
+        print(f"==> Checkpoint 1a - Prompt for Step 1: {prompt}")
+
         completion = openai.Completion.create(
             engine=self.gpt_deployment, 
             prompt=prompt, 
             temperature=0.0, 
             max_tokens=32, 
-            n=1, 
-            stop=["\n"])
+            n=1)
+        
         q = completion.choices[0].text
+        
+        # LAZIZ CHECKPOINT # 1b
+        print(f"==> Checkpoint 1b - Completion for Step 1: {q}")
+
 
         # STEP 2: Retrieve relevant documents from the search index with the GPT optimized query
         if overrides.get("semantic_ranker"):
@@ -81,7 +108,11 @@ Search query:
             results = [doc[self.sourcepage_field] + ": " + nonewlines(" . ".join([c.text for c in doc['@search.captions']])) for doc in r]
         else:
             results = [doc[self.sourcepage_field] + ": " + nonewlines(doc[self.content_field]) for doc in r]
-        content = "\n".join(results)
+        # content = "\n".join(results)
+        content = "".join(results)
+
+        # LAZIZ CHECKPOINT # 2
+        print(f"==> Checkpoint 2a - Search results: {content}")
 
         follow_up_questions_prompt = self.follow_up_questions_prompt_content if overrides.get("suggest_followup_questions") else ""
         
@@ -90,25 +121,65 @@ Search query:
         if prompt_override is None:
             prompt = self.prompt_prefix.format(injected_prompt="", sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
         elif prompt_override.startswith(">>>"):
-            prompt = self.prompt_prefix.format(injected_prompt=prompt_override[3:] + "\n", sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
+            # prompt = self.prompt_prefix.format(injected_prompt=prompt_override[3:] + "\n", sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
+            prompt = self.prompt_prefix.format(injected_prompt=prompt_override[3:] + ", ", sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
         else:
             prompt = prompt_override.format(sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
 
+        # LAZIZ CHECKPOINT # 3
+        print(f"==> Checkpoint 3: {prompt}")
+
         # STEP 3: Generate a contextual and content specific answer using the search results and chat history
-        completion = openai.Completion.create(
+        # completion = openai.Completion.create(
+        #     engine=self.chatgpt_deployment, 
+        #     prompt=prompt, 
+        #     temperature=overrides.get("temperature") or 0.7, 
+        #     max_tokens=1024, 
+        #     n=1, 
+        #     stop=["<|im_end|>", "<|im_start|>"])
+        prompt = ''.join(prompt.split('\n'))
+
+        # LAZIZ CHECKPOINT # 4
+        print(f"==> Checkpoint 4: {prompt}")
+
+        completion = openai.ChatCompletion.create(
             engine=self.chatgpt_deployment, 
-            prompt=prompt, 
+            messages=prompt, 
             temperature=overrides.get("temperature") or 0.7, 
             max_tokens=1024, 
-            n=1, 
-            stop=["<|im_end|>", "<|im_start|>"])
+            n=1)
 
-        return {"data_points": results, "answer": completion.choices[0].text, "thoughts": f"Searched for:<br>{q}<br><br>Prompt:<br>" + prompt.replace('\n', '<br>')}
+        # return {"data_points": results, "answer": completion.choices[0].text, "thoughts": f"Searched for:<br>{q}<br><br>Prompt:<br>" + prompt.replace('\n', '<br>')}
+        return {"data_points": results, "answer": completion.choices[0]['message']['content'], "thoughts": f"Searched for:<br>{q}<br><br>Prompt:<br>" + prompt.replace('\n', '<br>')}
     
+    # def get_chat_history_as_text(self, history, include_last_turn=True, approx_max_tokens=1000) -> str:
+    #     history_text = ""
+    #     for h in reversed(history if include_last_turn else history[:-1]):
+    #         history_text = """<|im_start|>user""" +"\n" + h["user"] + "\n" + """<|im_end|>""" + "\n" + """<|im_start|>assistant""" + "\n" + (h.get("bot") + """<|im_end|>""" if h.get("bot") else "") + "\n" + history_text
+    #         if len(history_text) > approx_max_tokens*4:
+    #             break    
+    #     return history_text
     def get_chat_history_as_text(self, history, include_last_turn=True, approx_max_tokens=1000) -> str:
-        history_text = ""
+
+        history_text = []
         for h in reversed(history if include_last_turn else history[:-1]):
-            history_text = """<|im_start|>user""" +"\n" + h["user"] + "\n" + """<|im_end|>""" + "\n" + """<|im_start|>assistant""" + "\n" + (h.get("bot") + """<|im_end|>""" if h.get("bot") else "") + "\n" + history_text
+            history_text.append({
+                "role": "user",
+                "content": h["user"]
+            })
+
+            if h.get("bot"):
+                history_text.append({
+                    "role": "assistant",
+                    "content": h["bot"]
+                })
+
             if len(history_text) > approx_max_tokens*4:
-                break    
-        return history_text
+                break 
+        
+        # LAZIZ CHECKPOINT # 5a
+        print(f"==> Checkpoint 5a - History for Step 3: {json.dumps(history_text, indent=4)}")
+
+        return json.dumps(history_text, indent=4)
+
+        
